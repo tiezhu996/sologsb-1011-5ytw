@@ -1,5 +1,5 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
-export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
+export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored' | 'conflict';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
 export interface CaptionSegment {
@@ -15,6 +15,7 @@ export interface CaptionSegment {
   source: SegmentSource;
   state: SegmentState;
   duplicateOf?: string;
+  conflictWith?: string;
   staleReason?: string;
   revision: number;
   tags: string[];
@@ -191,9 +192,38 @@ export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[
   });
 }
 
+export const SEGMENT_DURATION_SECONDS = 7;
+
+export function intervalsOverlap(a: CaptionSegment, b: CaptionSegment): boolean {
+  return a.startTime < b.startTime + SEGMENT_DURATION_SECONDS && b.startTime < a.startTime + SEGMENT_DURATION_SECONDS;
+}
+
+export function detectTimeConflicts(segments: CaptionSegment[]): CaptionSegment[] {
+  // 先自愈：撞期另一方已不在冲突状态时，剩余片段恢复为已确认。
+  const healed = segments.map((item): CaptionSegment => {
+    if (item.state !== 'conflict') return item;
+    const hasPartner = segments.some((other) => other.id !== item.id && other.state === 'conflict' && intervalsOverlap(item, other));
+    return hasPartner ? item : { ...item, state: 'confirmed', conflictWith: undefined };
+  });
+  const confirmed = healed.filter((item) => item.state === 'confirmed');
+  const partnerOf = new Map<string, string>();
+  for (let index = 0; index < confirmed.length; index += 1) {
+    for (let other = index + 1; other < confirmed.length; other += 1) {
+      if (!intervalsOverlap(confirmed[index], confirmed[other])) continue;
+      if (!partnerOf.has(confirmed[index].id)) partnerOf.set(confirmed[index].id, confirmed[other].id);
+      if (!partnerOf.has(confirmed[other].id)) partnerOf.set(confirmed[other].id, confirmed[index].id);
+    }
+  }
+  if (!partnerOf.size) return healed;
+  return healed.map((item): CaptionSegment => {
+    const partner = partnerOf.get(item.id);
+    return partner ? { ...item, state: 'conflict', conflictWith: partner } : item;
+  });
+}
+
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
   const seen: string[] = [];
-  const segments = model.segments
+  const sorted = model.segments
     .map((item) => ({ ...item }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
     .map((item): CaptionSegment => {
@@ -203,13 +233,15 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
         if (item.staleReason) item.state = 'stale';
       }
       const duplicate = isDuplicate(item, seen.map((id) => model.segments.find((segmentItem) => segmentItem.id === id)).filter(Boolean) as CaptionSegment[]);
-      if (duplicate && item.state !== 'confirmed') {
+      if (duplicate && item.state !== 'confirmed' && item.state !== 'conflict') {
         item.state = 'duplicate';
         item.duplicateOf = duplicate.id;
       }
       if (item.state !== 'ignored') seen.push(item.id);
       return item;
     });
+  // 时段冲突检测：两条已确认片段的 7 秒区间相交即视为撞期，双方退回待确认区。
+  const segments = detectTimeConflicts(sorted);
 
   return {
     ...model,
@@ -225,13 +257,15 @@ export function queueStats(model: DeskModel) {
   const pending = model.segments.filter((item) => item.state === 'pending');
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
+  const conflict = model.segments.filter((item) => item.state === 'conflict');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
+    conflict: conflict.length,
     offline: offline.length,
-    backlog: pending.length + stale.length + duplicate.length + offline.length,
+    backlog: pending.length + stale.length + duplicate.length + conflict.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
 }
@@ -301,6 +335,6 @@ export function toSrt(model: DeskModel): string {
   return model.segments
     .filter((item) => item.state === 'confirmed')
     .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + SEGMENT_DURATION_SECONDS)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
 }

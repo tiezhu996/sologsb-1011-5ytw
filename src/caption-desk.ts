@@ -4,9 +4,11 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  intervalsOverlap,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  SEGMENT_DURATION_SECONDS,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
@@ -38,6 +40,7 @@ function stateLabel(state: SegmentState): string {
     duplicate: '重复片段',
     stale: '过期修改',
     ignored: '已忽略',
+    conflict: '时段冲突',
   }[state];
 }
 
@@ -122,7 +125,7 @@ export class CaptionDesk extends LitElement {
     .header-actions cds-button { --cds-button-primary: #0f62fe; }
 
     .status-strip {
-      min-height: 60px; padding: 8px 20px; display: grid; grid-template-columns: 1.5fr repeat(4, minmax(118px, .6fr)) auto;
+      min-height: 60px; padding: 8px 20px; display: grid; grid-template-columns: 1.5fr repeat(5, minmax(118px, .6fr)) auto;
       gap: 0; align-items: stretch; background: var(--cds-layer, #fff); border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0);
     }
     .status-cell { padding: 7px 16px; border-right: 1px solid var(--cds-border-subtle, #e0e0e0); display: flex; flex-direction: column; justify-content: center; }
@@ -162,18 +165,21 @@ export class CaptionDesk extends LitElement {
     .segment-card.duplicate { border-left-color: #a56eff; }
     .segment-card.stale { border-left-color: #f1c21b; background: color-mix(in srgb, #fff 92%, #f1c21b 8%); }
     .segment-card.confirmed { border-left-color: #42be65; }
+    .segment-card.conflict { border-left-color: #da1e28; }
     .segment-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
     .segment-meta > span:first-child { color: var(--cds-text-secondary, #525252); font: 500 10px/1 "IBM Plex Mono", monospace; }
     .segment-state { font-size: 10px; color: #525252; }
     .segment-state.stale { color: #8d6e00; }
     .segment-state.duplicate { color: #6929c4; }
     .segment-state.confirmed { color: #198038; }
+    .segment-state.conflict { color: #da1e28; }
     .segment-text { margin: 0; font-size: var(--caption-font-size); line-height: 1.5; }
     .segment-corrected { margin: 6px 0 0; padding-left: 8px; border-left: 2px solid #42be65; color: #198038; font-size: calc(var(--caption-font-size) * .88); line-height: 1.45; }
     .segment-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
     .segment-foot b { color: #0f62fe; font-weight: 500; }
     .issue-note { margin-top: 8px; padding: 7px 8px; background: #fff8e1; border-left: 2px solid #f1c21b; color: #684e00; font-size: 10px; line-height: 1.45; }
     .duplicate-note { background: #f6f2ff; border-color: #a56eff; color: #491d8b; }
+    .conflict-note { background: #fff1f1; border-color: #da1e28; color: #a2191f; }
 
     .empty { padding: 48px 24px; text-align: center; color: var(--cds-text-secondary, #525252); }
     .empty strong { display: block; color: var(--cds-text-primary, #161616); margin-bottom: 6px; }
@@ -217,13 +223,14 @@ export class CaptionDesk extends LitElement {
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
+    .conflict-status { background: #fff1f1; border-left-color: #da1e28; color: #a2191f; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
     @media (max-width: 1280px) {
       .workspace { grid-template-columns: minmax(340px, .85fr) minmax(410px, 1fr) minmax(330px, .85fr); }
-      .status-strip { grid-template-columns: 1.4fr repeat(4, minmax(100px, .55fr)); }
+      .status-strip { grid-template-columns: 1.4fr repeat(5, minmax(100px, .55fr)); }
       .font-controls { display: none; }
     }
 
@@ -233,7 +240,7 @@ export class CaptionDesk extends LitElement {
       .workspace { grid-template-columns: 1fr; overflow: visible; }
       .column { min-height: 520px; }
       .shell { display: block; }
-      .status-strip { grid-template-columns: repeat(4, 1fr); }
+      .status-strip { grid-template-columns: repeat(5, 1fr); }
       .status-cell.hero { grid-column: 1 / -1; }
     }
   `;
@@ -335,8 +342,8 @@ export class CaptionDesk extends LitElement {
 
   private get pendingSegments(): CaptionSegment[] {
     const items = this.model.segments.filter((item) => {
-      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate';
-      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate';
+      if (this.filter === 'active') return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate' || item.state === 'conflict';
+      if (this.filter === 'attention') return item.state === 'stale' || item.state === 'duplicate' || item.state === 'conflict';
       return true;
     });
     return [...items].sort((a, b) => a.sequence - b.sequence);
@@ -436,6 +443,10 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
+    if (selected.state === 'conflict') {
+      this.resolveConflictKeep();
+      return;
+    }
     const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
@@ -457,15 +468,52 @@ export class CaptionDesk extends LitElement {
     this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
   }
 
+  private conflictPartnerLabel(item: CaptionSegment): string {
+    const partner = this.model.segments.find((segment) => segment.id === item.conflictWith);
+    if (!partner) return '另一片段';
+    return `#${String(partner.sequence).padStart(3, '0')}（${formatClock(partner.startTime)}–${formatClock(partner.startTime + SEGMENT_DURATION_SECONDS)}）`;
+  }
+
+  private resolveConflictKeep(): void {
+    const selected = this.selected;
+    if (!selected || selected.state !== 'conflict') return;
+    const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id && !(item.state === 'conflict' && intervalsOverlap(item, selected)));
+    this.commit('保留冲突片段', (current) => {
+      const kept = current.segments.find((item) => item.id === selected.id);
+      if (!kept || kept.state !== 'conflict') return current;
+      const segments = current.segments.map((item): CaptionSegment => {
+        if (item.id === kept.id) {
+          return { ...item, state: 'confirmed', confirmedAt: item.confirmedAt ?? Date.now(), conflictWith: undefined, revision: item.revision + 1 };
+        }
+        if (item.state === 'conflict' && intervalsOverlap(item, kept)) {
+          return { ...item, state: 'ignored', conflictWith: undefined, staleReason: `时段冲突未保留（与第 ${kept.sequence} 段撞期），已从直播区下线`, revision: item.revision + 1 };
+        }
+        return item;
+      });
+      return { ...current, segments, selectedId: nextOrder[0]?.id ?? selected.id };
+    });
+    this.pushToast('success', '已保留所选片段', '撞期的另一片段已从直播区下线，且不会进入导出字幕');
+  }
+
   private ignoreSelected(): void {
     const selected = this.selected;
     if (!selected) return;
-    const next = this.pendingSegments.find((item) => item.id !== selected.id);
-    this.commit('忽略问题片段', (current) => ({
-      ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? { ...item, state: 'ignored', staleReason: '已人工忽略' } : item),
-      selectedId: next?.id ?? selected.id,
-    }));
+    const wasConflict = selected.state === 'conflict';
+    const next = this.pendingSegments.find((item) => item.id !== selected.id && !(item.state === 'conflict' && intervalsOverlap(item, selected)));
+    this.commit('忽略问题片段', (current) => {
+      let segments = current.segments.map((item): CaptionSegment => item.id === selected.id
+        ? { ...item, state: 'ignored', conflictWith: undefined, staleReason: wasConflict ? '时段冲突未保留，已从直播区下线' : '已人工忽略' }
+        : item);
+      if (wasConflict) {
+        // 撞期片段被忽略后，另一方若没有其他冲突，自动回到直播区。
+        segments = segments.map((item): CaptionSegment => {
+          if (item.state !== 'conflict' || !intervalsOverlap(item, selected)) return item;
+          const hasOtherConflict = segments.some((other) => other.id !== item.id && other.state === 'conflict' && intervalsOverlap(other, item));
+          return hasOtherConflict ? item : { ...item, state: 'confirmed', confirmedAt: item.confirmedAt ?? Date.now(), conflictWith: undefined };
+        });
+      }
+      return { ...current, segments, selectedId: next?.id ?? selected.id };
+    });
   }
 
   private recoverDuplicate(): void {
@@ -491,8 +539,13 @@ export class CaptionDesk extends LitElement {
     this.future = [];
     this.model = merged;
     this.persist();
-    const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    const conflictCount = merged.segments.filter((item) => item.state === 'conflict').length;
+    const outboxCount = merged.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
+    if (conflictCount > 0) {
+      this.pushToast('warning', '合并完成，发现时段冲突', `${conflictCount} 段字幕与同时段片段的 7 秒区间相交，已移入待确认区等待核对`);
+    } else {
+      this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    }
   }
 
   private addRuleFromSelection(): void {
@@ -617,6 +670,7 @@ export class CaptionDesk extends LitElement {
             </div>
             ${item.state === 'stale' && item.staleReason ? html`<div class="issue-note">${item.staleReason}。确认前请核对直播上下文。</div>` : nothing}
             ${item.state === 'duplicate' ? html`<div class="issue-note duplicate-note">${item.staleReason || '检测到重复片段'}，请保留或忽略。</div>` : nothing}
+            ${item.state === 'conflict' ? html`<div class="issue-note conflict-note">与 ${this.conflictPartnerLabel(item)} 的 7 秒区间相交，双方已移出直播区，请核对后保留一条。</div>` : nothing}
           </button>
         `)}
       </div>
@@ -638,11 +692,16 @@ export class CaptionDesk extends LitElement {
               <p class="editor-title">实时片段 #${String(item.sequence).padStart(3, '0')} · 到达于 ${formatAge(item.receivedAt)}</p>
             </div>
             <div class="editor-status">
-              <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
+              <cds-tag type=${item.state === 'conflict' ? 'red' : item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
               <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
             </div>
           </div>
           <div class="editor-form">
+            ${item.state === 'conflict' ? html`
+              <cds-inline-notification kind="error" low-contrast title="时段冲突待核对" subtitle=${`与 ${this.conflictPartnerLabel(item)} 的 7 秒区间相交，两段都已移出直播区。保留一条后，另一条不会进入直播区和导出字幕。`}>
+                <cds-button slot="action" size="sm" @click=${this.resolveConflictKeep}>保留此段</cds-button>
+              </cds-inline-notification>
+            ` : nothing}
             ${item.state === 'duplicate' ? html`
               <cds-inline-notification kind="warning" low-contrast title="重复片段提示" subtitle=${item.staleReason || '与已确认片段高度相似'}>
                 <cds-button slot="action" size="sm" @click=${this.recoverDuplicate}>保留并继续校对</cds-button>
@@ -682,10 +741,12 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint">${item.state === 'conflict'
+              ? html`时段冲突：保留此段后撞期片段自动下线；忽略此段则保留对方`
+              : html`<kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段`}</div>
             <div>
               <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              <cds-button kind="primary" @click=${this.confirmSelected}>${item.state === 'conflict' ? '保留此段（对方下线）' : '确认并送入直播区'}</cds-button>
             </div>
           </div>
         </div>
@@ -744,6 +805,7 @@ export class CaptionDesk extends LitElement {
             `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+          ${this.stats.conflict > 0 ? html`<div class="delivery-status conflict-status">${this.stats.conflict} 段字幕时段冲突待核对，处理前不会进入直播输出和 SRT 导出。</div>` : nothing}
         </section>
 
         <section class="inspector-section">
@@ -793,13 +855,14 @@ export class CaptionDesk extends LitElement {
 
         <section class="status-strip">
           <div class="status-cell hero">
-            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
-            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 离线待合并 ${stats.offline}</span>
+            <strong>${this.model.connection === 'offline' ? '离线校正中，确认后暂存发件箱' : stats.conflict > 0 ? '发现时段冲突，请在待确认区核对后保留一条' : stats.backlog > 8 ? '队列积压，建议优先处理过期片段' : '队列节奏正常，可以继续逐段确认'}</strong>
+            <span>待确认 ${stats.pending} · 过期 ${stats.stale} · 重复 ${stats.duplicate} · 待核对 ${stats.conflict} · 离线待合并 ${stats.offline}</span>
             <div class="queue-track"><span style=${`width:${backlogRatio}%`}></span></div>
           </div>
           <div class="status-cell"><strong>${stats.pending}</strong><span>待确认片段</span></div>
           <div class="status-cell warning"><strong>${stats.oldestWaitSeconds}s</strong><span>最长等待时间</span></div>
           <div class="status-cell danger"><strong>${stats.stale + stats.duplicate}</strong><span>需要明确处理</span></div>
+          <div class="status-cell ${stats.conflict > 0 ? 'danger' : ''}"><strong>${stats.conflict}</strong><span>时段冲突待核对</span></div>
           <div class="status-cell"><strong>${this.model.simulatedDelay.toFixed(1)}s</strong><span>当前流延迟</span></div>
           <div class="font-controls">
             <label>字幕字号</label>
