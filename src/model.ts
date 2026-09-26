@@ -1,6 +1,8 @@
 export type ConnectionState = 'connected' | 'degraded' | 'offline';
-export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
+export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored' | 'conflict';
 export type SegmentSource = 'live' | 'offline' | 'manual';
+
+export const SEGMENT_DURATION_SECONDS = 7;
 
 export interface CaptionSegment {
   id: string;
@@ -15,6 +17,7 @@ export interface CaptionSegment {
   source: SegmentSource;
   state: SegmentState;
   duplicateOf?: string;
+  conflictWith?: string;
   staleReason?: string;
   revision: number;
   tags: string[];
@@ -191,8 +194,98 @@ export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[
   });
 }
 
+export function intervalsOverlap(a: CaptionSegment, b: CaptionSegment): boolean {
+  return a.startTime < b.startTime + SEGMENT_DURATION_SECONDS && b.startTime < a.startTime + SEGMENT_DURATION_SECONDS;
+}
+
+export function markTimeConflicts(segments: CaptionSegment[]): CaptionSegment[] {
+  const confirmed = segments.filter((item) => item.state === 'confirmed');
+  const partners = new Map<string, CaptionSegment[]>();
+  for (let i = 0; i < confirmed.length; i += 1) {
+    for (let j = i + 1; j < confirmed.length; j += 1) {
+      if (intervalsOverlap(confirmed[i], confirmed[j])) {
+        partners.set(confirmed[i].id, [...(partners.get(confirmed[i].id) ?? []), confirmed[j]]);
+        partners.set(confirmed[j].id, [...(partners.get(confirmed[j].id) ?? []), confirmed[i]]);
+      }
+    }
+  }
+  if (!partners.size) return segments;
+  return segments.map((item) => {
+    const hits = partners.get(item.id);
+    if (!hits) return item;
+    const ordered = [...hits].sort((a, b) => a.sequence - b.sequence);
+    const label = ordered.map((hit) => `第 ${hit.sequence} 段`).join('、');
+    return {
+      ...item,
+      state: 'conflict',
+      conflictWith: ordered[0].id,
+      staleReason: `时段冲突：与${label}的 ${SEGMENT_DURATION_SECONDS} 秒区间相交，需核对后保留一条`,
+    };
+  });
+}
+
+export function resolveConflict(model: DeskModel, keepId: string): DeskModel {
+  const keeper = model.segments.find((item) => item.id === keepId);
+  if (!keeper || keeper.state !== 'conflict') return model;
+  const segments = model.segments.map((item) => {
+    if (item.id === keeper.id) {
+      return {
+        ...item,
+        state: 'confirmed' as SegmentState,
+        confirmedAt: item.confirmedAt ?? Date.now(),
+        conflictWith: undefined,
+        staleReason: undefined,
+        tags: [...new Set([...item.tags, '冲突已保留'])],
+        revision: item.revision + 1,
+      };
+    }
+    if (item.state === 'conflict' && intervalsOverlap(item, keeper)) {
+      return {
+        ...item,
+        state: 'ignored' as SegmentState,
+        conflictWith: undefined,
+        staleReason: `时段冲突未保留：与第 ${keeper.sequence} 段区间相交，已下线且不进入导出`,
+        tags: [...new Set([...item.tags, '冲突未保留'])],
+      };
+    }
+    return item;
+  });
+  return { ...model, segments: markTimeConflicts(segments), updatedAt: Date.now() };
+}
+
+export function ignoreSegment(model: DeskModel, id: string): DeskModel {
+  const target = model.segments.find((item) => item.id === id);
+  if (!target) return model;
+  const wasConflict = target.state === 'conflict';
+  const segments = model.segments.map((item) => {
+    if (item.id === id) {
+      return {
+        ...item,
+        state: 'ignored' as SegmentState,
+        conflictWith: undefined,
+        staleReason: wasConflict ? '时段冲突未保留：已人工忽略，下线且不进入导出' : '已人工忽略',
+      };
+    }
+    if (wasConflict && item.state === 'conflict' && intervalsOverlap(item, target)) {
+      return {
+        ...item,
+        state: 'confirmed' as SegmentState,
+        confirmedAt: item.confirmedAt ?? Date.now(),
+        conflictWith: undefined,
+        staleReason: undefined,
+        tags: [...new Set([...item.tags, '冲突已保留'])],
+      };
+    }
+    return item;
+  });
+  return { ...model, segments: markTimeConflicts(segments), updatedAt: Date.now() };
+}
+
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
   const seen: string[] = [];
+  const outboxIds = new Set(
+    model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').map((item) => item.id),
+  );
   const segments = model.segments
     .map((item) => ({ ...item }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
@@ -211,9 +304,32 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
       return item;
     });
 
+  // 断线期间直播端补发的同一时段内容，恢复时随合并一起到达
+  let nextSequence = model.nextSequence;
+  const resends: CaptionSegment[] = segments
+    .filter((item) => outboxIds.has(item.id) && !segments.some((existing) => existing.id === `seg-resend-${item.id}`))
+    .map((item): CaptionSegment => ({
+      id: `seg-resend-${item.id}`,
+      sequence: nextSequence++,
+      startTime: item.startTime,
+      receivedAt: item.confirmedAt ?? Date.now(),
+      confirmedAt: item.confirmedAt ?? Date.now(),
+      speaker: item.speaker,
+      original: item.original,
+      corrected: item.original,
+      numberHints: '',
+      source: 'live',
+      state: 'confirmed',
+      revision: 0,
+      tags: ['直播端补发'],
+    }));
+
+  const merged = [...segments, ...resends].sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime);
+
   return {
     ...model,
-    segments,
+    segments: markTimeConflicts(merged),
+    nextSequence,
     connection: 'connected',
     simulatedDelay: Math.max(0.8, model.simulatedDelay - 0.7),
     lastMergedAt: Date.now(),
@@ -225,13 +341,15 @@ export function queueStats(model: DeskModel) {
   const pending = model.segments.filter((item) => item.state === 'pending');
   const stale = model.segments.filter((item) => item.state === 'stale');
   const duplicate = model.segments.filter((item) => item.state === 'duplicate');
+  const conflict = model.segments.filter((item) => item.state === 'conflict');
   const offline = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
   return {
     pending: pending.length,
     stale: stale.length,
     duplicate: duplicate.length,
+    conflict: conflict.length,
     offline: offline.length,
-    backlog: pending.length + stale.length + duplicate.length + offline.length,
+    backlog: pending.length + stale.length + duplicate.length + conflict.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
 }
@@ -301,6 +419,6 @@ export function toSrt(model: DeskModel): string {
   return model.segments
     .filter((item) => item.state === 'confirmed')
     .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + SEGMENT_DURATION_SECONDS)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
 }
